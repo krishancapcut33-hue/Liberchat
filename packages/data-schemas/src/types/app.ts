@@ -71,6 +71,8 @@ export interface AppConfig {
   githubCompare?: TCustomConfig['githubCompare'];
   /** Outbound call budgets; unset keys fall back to the server defaults */
   timeouts?: TCustomConfig['timeouts'];
+  /** Bounds on parallel per-request lookups; unset keys fall back to the server defaults */
+  concurrency?: TCustomConfig['concurrency'];
   skillDeletion?: {
     finalizationEnabled?: boolean;
     sweepIntervalMs?: number;
