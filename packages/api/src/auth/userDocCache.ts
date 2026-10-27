@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { logger, evictAuthUserDocs } from '@librechat/data-schemas';
+import { logger, evictAuthUserDocs, isAuthUserDocEvictionFenced } from '@librechat/data-schemas';
 import {
   CacheKeys,
   AUTH_USER_DOC_BY_ID_PREFIX,
@@ -31,8 +31,13 @@ export interface AuthUserDocCacheKeyInput {
 interface CachedAuthUserDoc {
   version: number;
   cachedAt: number;
+  /** Two cache TTLs after the lookup began; never served later, however late it was written. */
+  expiresAt: number;
   user: CachedAuthUser;
 }
+
+/** How long after its lookup began a document may still be served; the eviction fence outlasts it. */
+const AUTH_USER_DOC_MAX_AGE_MS = AUTH_USER_DOC_CACHE_TTL_MS * 2;
 
 type CachedAuthUser = Omit<Partial<IUser>, '_id'> & {
   _id?: string;
@@ -157,6 +162,14 @@ export async function getCachedAuthUserDoc(
     if (!cached || cached.version !== AUTH_USER_DOC_CACHE_VERSION || !cached.user) {
       return undefined;
     }
+    if (typeof cached.expiresAt !== 'number' || Date.now() > cached.expiresAt) {
+      return undefined;
+    }
+    /** A recent eviction means this document may predate the change it evicted. */
+    const userId = getUserId(cached.user);
+    if (!userId || (await isAuthUserDocEvictionFenced(store, userId))) {
+      return undefined;
+    }
     return cached.user;
   } catch (error) {
     logger.warn('[authUserDocCache] Cache read failed; falling back to user lookup', {
@@ -168,27 +181,44 @@ export async function getCachedAuthUserDoc(
 
 /**
  * The reverse index is written first and outlives every document it names, so eviction can
- * always find a cached document: when the index write fails, the document is not cached.
+ * usually find a cached document: when the index write fails, the document is not cached.
+ * `lookupStartedAt` is when the database read of `user` began. A document's lifetime is anchored
+ * to it rather than to the write: it expires, and is never served, two cache TTLs after the
+ * lookup began, however long the writes took. An eviction's fence lasts three TTLs from a moment
+ * after any lookup it can race, so it hides every document read before it, including one the
+ * reverse index lost.
  */
 export async function setCachedAuthUserDoc(
   store: AuthUserDocCacheStore,
   cacheKey: string,
   user: Partial<IUser>,
+  lookupStartedAt: number,
 ): Promise<void> {
+  const expiresAt = lookupStartedAt + AUTH_USER_DOC_MAX_AGE_MS;
+  if (Date.now() - lookupStartedAt > AUTH_USER_DOC_CACHE_TTL_MS) {
+    return;
+  }
   try {
     const sanitized = sanitizeUserForCache(user);
     const userId = getUserId(sanitized);
     if (userId) {
       await rememberUserCacheKey(store, userId, cacheKey, AUTH_USER_DOC_CACHE_TTL_MS * 2);
     }
+    /** Measured after the index write, which can stall, so the entry still expires on time. */
+    const now = Date.now();
+    const ttl = Math.min(AUTH_USER_DOC_CACHE_TTL_MS, expiresAt - now);
+    if (ttl <= 0) {
+      return;
+    }
     await store.set(
       cacheKey,
       {
         version: AUTH_USER_DOC_CACHE_VERSION,
-        cachedAt: Date.now(),
+        cachedAt: now,
+        expiresAt,
         user: sanitized,
       } satisfies CachedAuthUserDoc,
-      AUTH_USER_DOC_CACHE_TTL_MS,
+      ttl,
     );
   } catch (error) {
     logger.warn('[authUserDocCache] Cache write failed', {
