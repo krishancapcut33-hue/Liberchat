@@ -1,10 +1,15 @@
 import { memo, useRef, useMemo, useState, useLayoutEffect } from 'react';
+import { useAtomValue } from 'jotai';
 import * as Ariakit from '@ariakit/react';
 import { ChevronDown } from 'lucide-react';
+import { Constants } from 'librechat-data-provider';
+import { getAppendParentMessageId } from '@librechat/chat';
+import { queuedMessagesByConvoId } from '@librechat/chat/react';
 import { Button, TooltipAnchor, useMediaQuery } from '@librechat/client';
 import type { SettingDefinition, TConversation, TReasoningOverride } from 'librechat-data-provider';
 import { ReasoningControl, useComposerReasoning } from '../Reasoning';
 import Effort, { effortRank, resolveEffortLabel } from './Effort';
+import { getBranchReasoning } from '~/hooks/Chat/ask/reasoning';
 import { useGetStartupConfig } from '~/data-provider';
 import { useChatContext } from '~/Providers';
 import { cn, getModelSpec } from '~/utils';
@@ -250,7 +255,7 @@ interface ThinkingProps {
 }
 
 function Thinking({ index, disabled, hasAddedConversation }: ThinkingProps) {
-  const { conversation } = useChatContext();
+  const { conversation, latestMessageId, getMessages } = useChatContext();
   const { data: startupConfig } = useGetStartupConfig();
   const parametersEnabled = startupConfig?.interface?.parameters;
   const modelSpec = getModelSpec({ specName: conversation?.spec, startupConfig });
@@ -260,12 +265,33 @@ function Thinking({ index, disabled, hasAddedConversation }: ThinkingProps) {
     }
     return new Set(Object.keys(modelSpec.preset));
   }, [modelSpec?.preset, startupConfig?.modelSpecs?.enforce]);
+  const queueKey =
+    conversation?.conversationId != null && conversation.conversationId !== ''
+      ? conversation.conversationId
+      : Constants.NEW_CONVO;
+  const queued = useAtomValue(queuedMessagesByConvoId(queueKey));
+  const lastQueued = queued[queued.length - 1];
+  /* Read where the next turn will attach, the same place the send and queue paths inherit from,
+     so the button names the level the next message will actually carry: the last queued turn
+     while any wait, otherwise the branch the composer extends. */
+  const branchReasoning = useMemo(() => {
+    if (lastQueued != null) {
+      return lastQueued.reasoningOverride;
+    }
+    const messages = getMessages(conversation?.conversationId) ?? [];
+    const latestMessage = messages.find((message) => message.messageId === latestMessageId);
+    return getBranchReasoning(
+      messages,
+      getAppendParentMessageId({ latestMessage: latestMessage ?? null, currentMessages: messages }),
+    );
+  }, [conversation?.conversationId, getMessages, lastQueued, latestMessageId]);
   const reasoning = useComposerReasoning({
     conversation: conversation ?? null,
     index,
     hasAddedConversation,
     enabled: parametersEnabled,
     blockedReasoningKeys,
+    branchReasoning,
   });
 
   if (parametersEnabled !== true || reasoning == null) {
