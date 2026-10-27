@@ -443,11 +443,17 @@ export async function discoverConnectedAgents(
     onAgentSkipped?.(agentId);
   };
 
-  const processAgent = async (agentId: string): Promise<Agent | null> => {
-    const loaded = await initializeReferencedAgent(agentId, params, {
+  const loadAgent = (agentId: string): ReturnType<typeof initializeReferencedAgent> =>
+    initializeReferencedAgent(agentId, params, {
       ...deps,
       onAgentSkipped: markSkipped,
     });
+
+  /** Side effects are applied in discovery order so merges stay deterministic. */
+  const applyLoaded = (
+    agentId: string,
+    loaded: Awaited<ReturnType<typeof initializeReferencedAgent>>,
+  ): Agent | null => {
     if (!loaded) {
       return null;
     }
@@ -466,6 +472,9 @@ export async function discoverConnectedAgents(
     return agent;
   };
 
+  const processAgent = async (agentId: string): Promise<Agent | null> =>
+    applyLoaded(agentId, await loadAgent(agentId));
+
   const checkAgentInit = (agentId: string): boolean =>
     agentId === primaryConfig.id || agentConfigs.has(agentId);
 
@@ -476,20 +485,51 @@ export async function discoverConnectedAgents(
 
   collectEdges(primaryConfig.edges);
 
+  const loadDiscovered = createConcurrencyLimiter(SUBAGENT_GRAPH_LOAD_CONCURRENCY);
   while (agentsToProcess.size > 0) {
-    const agentId = agentsToProcess.values().next().value as string;
-    agentsToProcess.delete(agentId);
-    try {
-      const agent = await processAgent(agentId);
+    /** One BFS level: agents already queued are independent, so load them together
+     *  and fold results back in queue order. Edges they expose form the next level. */
+    const level = [...agentsToProcess];
+    agentsToProcess.clear();
+    /** Outcomes never reject; a fatal error also rejects `fatal`, so it surfaces as soon
+     *  as it happens instead of after earlier, slower siblings finish. */
+    let rejectFatal: (error: unknown) => void = () => undefined;
+    const fatal = new Promise<never>((_, reject) => {
+      rejectFatal = reject;
+    });
+    fatal.catch(() => undefined);
+    const outcomes = level.map((agentId) =>
+      loadDiscovered(async () => {
+        try {
+          return { loaded: await loadAgent(agentId) };
+        } catch (error) {
+          if (isFatalAgentInitializationError(error, { signal: params.signal })) {
+            rejectFatal(error);
+          }
+          return { error };
+        }
+      }),
+    );
+    /** Stage every loaded config before collecting edges, so a sibling referenced by
+     *  another member of the level is not queued a second time. */
+    const loadedAgents: Array<Agent | null> = [];
+    for (let index = 0; index < level.length; index++) {
+      const agentId = level[index];
+      const outcome = await Promise.race([outcomes[index], fatal]);
+      if ('error' in outcome) {
+        if (isFatalAgentInitializationError(outcome.error, { signal: params.signal })) {
+          throw outcome.error;
+        }
+        logger.error(`[discoverConnectedAgents] Error processing agent ${agentId}:`, outcome.error);
+        markSkipped(agentId);
+        continue;
+      }
+      loadedAgents.push(applyLoaded(agentId, outcome.loaded));
+    }
+    for (const agent of loadedAgents) {
       if (agent?.edges?.length) {
         collectEdges(agent.edges);
       }
-    } catch (err) {
-      if (isFatalAgentInitializationError(err, { signal: params.signal })) {
-        throw err;
-      }
-      logger.error(`[discoverConnectedAgents] Error processing agent ${agentId}:`, err);
-      markSkipped(agentId);
     }
   }
 

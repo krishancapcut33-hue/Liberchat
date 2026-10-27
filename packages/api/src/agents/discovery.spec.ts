@@ -1069,6 +1069,38 @@ describe('discoverConnectedAgents', () => {
     expect(result.edges).toHaveLength(2);
   });
 
+  it('initializes a sibling referenced by another member of the same level once', async () => {
+    const primaryConfig = makeConfig('A', [
+      { from: 'A', to: 'B', edgeType: 'handoff' },
+      { from: 'A', to: 'C', edgeType: 'handoff' },
+    ]);
+    const agents: Record<string, Agent> = {
+      B: makeAgent('B', [{ from: 'B', to: 'C', edgeType: 'handoff' }]),
+      C: makeAgent('C'),
+    };
+    const getAgent = jest.fn(async ({ id }: { id: string }) => agents[id] ?? null);
+
+    const result = await discoverConnectedAgents(
+      {
+        req: makeReq(),
+        res: makeRes(),
+        primaryConfig,
+        allowedProviders: new Set(),
+        modelsConfig: { openai: ['gpt-4o'] },
+        loadTools: jest.fn(),
+      },
+      {
+        getAgent,
+        checkPermission: jest.fn().mockResolvedValue(true),
+        logViolation: jest.fn(),
+        db: {} as never,
+      },
+    );
+
+    expect(getAgent.mock.calls.map(([arg]) => arg.id).sort()).toEqual(['B', 'C']);
+    expect([...result.agentConfigs.keys()]).toEqual(['B', 'C']);
+  });
+
   it('processes legacy agent_ids chain and adds sequential chain edges', async () => {
     const primaryConfig = makeConfig('A', []);
 
@@ -1198,6 +1230,78 @@ describe('discoverConnectedAgents', () => {
         {
           getAgent,
           checkPermission,
+          logViolation: jest.fn(),
+          db: {} as never,
+        },
+      ),
+    ).rejects.toBe(toolError);
+  });
+
+  it('propagates a fatal error without waiting for a blocked later sibling', async () => {
+    const toolError = Object.assign(new Error('tools unavailable'), {
+      code: 'AGENT_EXPECTED_MCP_TOOLS_UNAVAILABLE',
+      statusCode: 503,
+    });
+    mockInitializeAgent.mockImplementation(async ({ agent }: { agent: Agent }) => {
+      if (agent.id === 'B') {
+        throw toolError;
+      }
+      return new Promise<InitializedAgent>(() => undefined);
+    });
+    const primaryConfig = makeConfig('A', [
+      { from: 'A', to: 'B', edgeType: 'handoff' },
+      { from: 'A', to: 'C', edgeType: 'handoff' },
+    ]);
+
+    await expect(
+      discoverConnectedAgents(
+        {
+          req: makeReq(),
+          res: makeRes(),
+          primaryConfig,
+          allowedProviders: new Set(),
+          modelsConfig: { openai: ['gpt-4o'] },
+          loadTools: jest.fn(),
+        },
+        {
+          getAgent: jest.fn(async ({ id }: { id: string }) => makeAgent(id)),
+          checkPermission: jest.fn().mockResolvedValue(true),
+          logViolation: jest.fn(),
+          db: {} as never,
+        },
+      ),
+    ).rejects.toBe(toolError);
+  });
+
+  it('propagates a fatal error even when an earlier sibling is still pending', async () => {
+    const toolError = Object.assign(new Error('tools unavailable'), {
+      code: 'AGENT_EXPECTED_MCP_TOOLS_UNAVAILABLE',
+      statusCode: 503,
+    });
+    mockInitializeAgent.mockImplementation(async ({ agent }: { agent: Agent }) => {
+      if (agent.id === 'C') {
+        throw toolError;
+      }
+      return new Promise<InitializedAgent>(() => undefined);
+    });
+    const primaryConfig = makeConfig('A', [
+      { from: 'A', to: 'B', edgeType: 'handoff' },
+      { from: 'A', to: 'C', edgeType: 'handoff' },
+    ]);
+
+    await expect(
+      discoverConnectedAgents(
+        {
+          req: makeReq(),
+          res: makeRes(),
+          primaryConfig,
+          allowedProviders: new Set(),
+          modelsConfig: { openai: ['gpt-4o'] },
+          loadTools: jest.fn(),
+        },
+        {
+          getAgent: jest.fn(async ({ id }: { id: string }) => makeAgent(id)),
+          checkPermission: jest.fn().mockResolvedValue(true),
           logViolation: jest.fn(),
           db: {} as never,
         },
