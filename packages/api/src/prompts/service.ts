@@ -27,11 +27,15 @@ import {
   projectStoredPromptGroups,
 } from './protection';
 import {
+  safeValidatePromptPayload,
+  safeValidatePromptGroupUpdate,
+  safeValidatePromptGroupCategory,
+} from './schemas';
+import {
   markPublicPromptGroups,
   buildPromptGroupFilter,
   filterAccessibleIdsBySharedLogic,
 } from './format';
-import { safeValidatePromptGroupUpdate, safeValidatePromptPayload } from './schemas';
 import { createNativePromptAdapter, selectionUnavailableReason } from './native';
 import { createLangfuseSourceResolver } from '../langfuse/promptSync';
 import { createLangfusePromptAdapter } from './langfuse';
@@ -243,13 +247,21 @@ export function createPromptServiceFromAdapters(adapters: PromptServiceAdapters)
         sourcePromptName: _clientSourcePromptName,
         sourceProjectId: _clientSourceProjectId,
         sourceDestination: _clientSourceDestination,
-        ...group
+        ...clientGroup
       } = input.group as typeof input.group & {
         source?: unknown;
         sourcePromptName?: unknown;
         sourceProjectId?: unknown;
         sourceDestination?: unknown;
       };
+      let group = clientGroup;
+      if (group.category !== undefined) {
+        const category = safeValidatePromptGroupCategory(group.category);
+        if (!category.success) {
+          return invalidInput('Invalid request body', category.error.issues);
+        }
+        group = { ...group, category: category.data };
+      }
       const rejection = inspect({ prompt: validation.data, group }, filters);
       if (rejection != null) {
         return rejection;
